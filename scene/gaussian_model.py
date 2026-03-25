@@ -121,6 +121,23 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
+    def _estimate_init_dist2_fallback(self, points_np, spatial_lr_scale):
+        n = int(points_np.shape[0])
+        if n <= 1:
+            base = max(float(spatial_lr_scale) * 0.01, 1e-4)
+            return torch.full((n,), base * base, device="cuda", dtype=torch.float32)
+
+        mins = points_np.min(axis=0)
+        maxs = points_np.max(axis=0)
+        diag = float(np.linalg.norm(maxs - mins))
+        if not np.isfinite(diag) or diag <= 1e-8:
+            diag = max(float(spatial_lr_scale), 1.0)
+
+        # Heuristic nearest-neighbor spacing surrogate.
+        # This is only used when distCUDA2 is unavailable / unstable.
+        spacing = max(diag / np.sqrt(float(n)), 1e-4)
+        return torch.full((n,), spacing * spacing, device="cuda", dtype=torch.float32)
+
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, max_points: int = 0):
         self.spatial_lr_scale = spatial_lr_scale
         points_np = np.asarray(pcd.points)
@@ -144,7 +161,11 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
+        try:
+            dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
+        except Exception as exc:
+            print(f"[2DGS-init] distCUDA2 failed, fallback to heuristic scale init: {exc}")
+            dist2 = self._estimate_init_dist2_fallback(points_np, spatial_lr_scale)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 2)
         rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
 
