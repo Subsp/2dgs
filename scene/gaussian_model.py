@@ -121,17 +121,30 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, max_points: int = 0):
         self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        points_np = np.asarray(pcd.points)
+        colors_np = np.asarray(pcd.colors)
+
+        if max_points is not None and int(max_points) > 0 and points_np.shape[0] > int(max_points):
+            rng = np.random.default_rng(0)
+            keep = np.sort(rng.choice(points_np.shape[0], size=int(max_points), replace=False))
+            points_np = points_np[keep]
+            colors_np = colors_np[keep]
+            print(
+                "Downsampling init point cloud: "
+                f"{pcd.points.shape[0]} -> {points_np.shape[0]} (init_point_limit={int(max_points)})"
+            )
+
+        fused_point_cloud = torch.tensor(points_np).float().cuda()
+        fused_color = RGB2SH(torch.tensor(colors_np).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 2)
         rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
 
