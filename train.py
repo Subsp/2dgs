@@ -10,7 +10,10 @@
 #
 
 import os
+import re
 import torch
+import torch.nn.functional as torch_F
+from glob import glob
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -22,13 +25,195 @@ from tqdm import tqdm
 from utils.image_utils import psnr, render_net_image
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import numpy as np
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
+
+def _extract_trailing_int(stem):
+    match = re.search(r"(\d+)$", stem)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _sort_key_from_stem(stem):
+    idx = _extract_trailing_int(stem)
+    if idx is None:
+        return (1, 0, stem)
+    return (0, idx, stem)
+
+
+def _build_external_prior_index(train_cameras, external_prior_root, prior_subdir="priors", exts=("png", "jpg", "jpeg", "webp")):
+    root = os.path.abspath(os.path.expanduser(external_prior_root))
+    candidates = []
+    if prior_subdir:
+        candidates.append(os.path.join(root, prior_subdir))
+    candidates.append(root)
+
+    stem_to_path = {}
+    for folder in candidates:
+        if not os.path.isdir(folder):
+            continue
+        for ext in exts:
+            pattern = os.path.join(folder, "**", f"*.{ext}")
+            for path in sorted(glob(pattern, recursive=True)):
+                stem = os.path.splitext(os.path.basename(path))[0]
+                if stem not in stem_to_path:
+                    stem_to_path[stem] = path
+
+    index = {}
+    used_paths = set()
+    exact_count = 0
+    numeric_count = 0
+    order_count = 0
+
+    for camera in train_cameras:
+        path = stem_to_path.get(camera.image_name)
+        if path is None or path in used_paths:
+            continue
+        index[camera.image_name] = path
+        used_paths.add(path)
+        exact_count += 1
+
+    unmatched = [cam for cam in train_cameras if cam.image_name not in index]
+    idx_to_paths = {}
+    for stem, path in sorted(stem_to_path.items(), key=lambda x: _sort_key_from_stem(x[0])):
+        idx = _extract_trailing_int(stem)
+        if idx is None:
+            continue
+        idx_to_paths.setdefault(idx, []).append(path)
+
+    for camera in unmatched:
+        idx = _extract_trailing_int(camera.image_name)
+        if idx is None:
+            continue
+        candidates = [p for p in idx_to_paths.get(idx, []) if p not in used_paths]
+        if not candidates:
+            continue
+        picked = candidates[0]
+        index[camera.image_name] = picked
+        used_paths.add(picked)
+        numeric_count += 1
+
+    unmatched = [cam for cam in train_cameras if cam.image_name not in index]
+    if unmatched:
+        available_paths = []
+        for stem, path in sorted(stem_to_path.items(), key=lambda x: _sort_key_from_stem(x[0])):
+            if path in used_paths:
+                continue
+            available_paths.append(path)
+
+        unmatched_sorted = sorted(unmatched, key=lambda cam: _sort_key_from_stem(cam.image_name))
+        pair_count = min(len(unmatched_sorted), len(available_paths))
+        for i in range(pair_count):
+            camera = unmatched_sorted[i]
+            picked = available_paths[i]
+            index[camera.image_name] = picked
+            used_paths.add(picked)
+            order_count += 1
+
+    missing = len(train_cameras) - len(index)
+    print(
+        "[2DGS-PRIOR] external index size: "
+        f"{len(index)} matched / {len(train_cameras)} train views "
+        f"(missing={missing}, root={root})"
+    )
+    if len(index) > 0:
+        print(
+            "[2DGS-PRIOR] external match breakdown: "
+            f"exact={exact_count}, numeric={numeric_count}, order={order_count}"
+        )
+    return index
+
+
+class ImageTensorBank:
+    def __init__(self, index, mode="rgb"):
+        self.index = index
+        self.mode = mode
+        self.cache = {}
+
+    def _load_tensor(self, image_name):
+        path = self.index.get(image_name)
+        if path is None or not os.path.exists(path):
+            return None
+        from PIL import Image
+
+        if self.mode == "mask":
+            arr = np.array(Image.open(path).convert("L"), dtype=np.float32) / 255.0
+            tensor = torch.from_numpy(arr).unsqueeze(0).contiguous()
+        else:
+            arr = np.array(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
+            tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+        return tensor
+
+    def get(self, image_name, width, height, device):
+        if image_name not in self.cache:
+            tensor = self._load_tensor(image_name)
+            if tensor is None:
+                return None
+            self.cache[image_name] = tensor
+
+        tensor = self.cache[image_name]
+        if tensor.shape[-2:] != (height, width):
+            interp_mode = "bilinear" if tensor.shape[0] > 1 else "nearest"
+            tensor = torch_F.interpolate(
+                tensor.unsqueeze(0),
+                size=(height, width),
+                mode=interp_mode,
+                align_corners=False if interp_mode == "bilinear" else None,
+            )[0]
+        return tensor.to(device=device)
+
+
+def _masked_l1(pred, target, mask):
+    diff = (pred - target).abs()
+    if mask is None:
+        return diff.mean()
+    weighted = diff * mask
+    denom = torch.clamp(mask.sum() * diff.shape[0], min=1.0)
+    return weighted.sum() / denom
+
+
+def _laplacian_highfreq_rgb(image):
+    kernel = torch.tensor(
+        [[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]],
+        device=image.device,
+        dtype=image.dtype,
+    ).view(1, 1, 3, 3)
+    kernel = kernel.repeat(image.shape[0], 1, 1, 1)
+    out = torch_F.conv2d(image.unsqueeze(0), kernel, padding=1, groups=image.shape[0])[0]
+    return out
+
+
+def _load_prior_supervision(prior_bank, mask_bank, camera, device):
+    if prior_bank is None or camera is None:
+        return None
+    prior_image = prior_bank.get(
+        camera.image_name,
+        width=int(camera.image_width),
+        height=int(camera.image_height),
+        device=device,
+    )
+    if prior_image is None:
+        return None
+    mask = None
+    if mask_bank is not None:
+        mask = mask_bank.get(
+            camera.image_name,
+            width=int(camera.image_width),
+            height=int(camera.image_height),
+            device=device,
+        )
+        if mask is not None:
+            mask = mask.clamp(0.0, 1.0)
+    return {"prior_image": prior_image, "mask": mask}
+
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, prior_args):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -48,6 +233,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_dist_for_log = 0.0
     ema_normal_for_log = 0.0
+    ema_prior_l1_for_log = 0.0
+    ema_prior_hf_for_log = 0.0
+
+    prior_bank = None
+    mask_bank = None
+    if getattr(prior_args, "external_prior_root", ""):
+        prior_exts = tuple(
+            tok.strip().lower()
+            for tok in str(getattr(prior_args, "external_prior_exts", "png,jpg,jpeg,webp")).split(",")
+            if tok.strip()
+        )
+        train_cameras = scene.getTrainCameras()
+        prior_index = _build_external_prior_index(
+            train_cameras=train_cameras,
+            external_prior_root=prior_args.external_prior_root,
+            prior_subdir=getattr(prior_args, "external_prior_subdir", "priors"),
+            exts=prior_exts,
+        )
+        prior_bank = ImageTensorBank(prior_index, mode="rgb")
+        if getattr(prior_args, "external_prior_mask_subdir", ""):
+            mask_index = _build_external_prior_index(
+                train_cameras=train_cameras,
+                external_prior_root=prior_args.external_prior_root,
+                prior_subdir=prior_args.external_prior_mask_subdir,
+                exts=prior_exts,
+            )
+            mask_bank = ImageTensorBank(mask_index, mode="mask")
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -72,6 +284,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        prior_l1_loss = torch.zeros((), device=image.device)
+        prior_hf_loss = torch.zeros((), device=image.device)
+
+        prior_pack = _load_prior_supervision(prior_bank, mask_bank, viewpoint_cam, image.device)
+        if prior_pack is not None:
+            prior_image = prior_pack["prior_image"]
+            prior_mask = prior_pack["mask"]
+            if prior_mask is not None and float(getattr(prior_args, "prior_mask_floor", 0.0)) > 0.0:
+                prior_mask = (prior_mask >= float(prior_args.prior_mask_floor)).float()
+            if float(getattr(prior_args, "prior_l1_weight", 0.0)) > 0.0:
+                prior_l1_loss = _masked_l1(image, prior_image, prior_mask)
+            if float(getattr(prior_args, "prior_hf_weight", 0.0)) > 0.0:
+                image_hf = _laplacian_highfreq_rgb(image)
+                prior_hf = _laplacian_highfreq_rgb(prior_image)
+                hf_mask = None if prior_mask is None else prior_mask.expand_as(image_hf[:1])
+                prior_hf_loss = _masked_l1(image_hf, prior_hf, hf_mask)
+            loss = (
+                loss
+                + float(getattr(prior_args, "prior_l1_weight", 0.0)) * prior_l1_loss
+                + float(getattr(prior_args, "prior_hf_weight", 0.0)) * prior_hf_loss
+            )
         
         # regularization
         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
@@ -96,6 +329,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_dist_for_log = 0.4 * dist_loss.item() + 0.6 * ema_dist_for_log
             ema_normal_for_log = 0.4 * normal_loss.item() + 0.6 * ema_normal_for_log
+            ema_prior_l1_for_log = 0.4 * prior_l1_loss.item() + 0.6 * ema_prior_l1_for_log
+            ema_prior_hf_for_log = 0.4 * prior_hf_loss.item() + 0.6 * ema_prior_hf_for_log
 
 
             if iteration % 10 == 0:
@@ -103,6 +338,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                     "distort": f"{ema_dist_for_log:.{5}f}",
                     "normal": f"{ema_normal_for_log:.{5}f}",
+                    "prior_l1": f"{ema_prior_l1_for_log:.{5}f}",
+                    "prior_hf": f"{ema_prior_hf_for_log:.{5}f}",
                     "Points": f"{len(gaussians.get_xyz)}"
                 }
                 progress_bar.set_postfix(loss_dict)
@@ -115,6 +352,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if tb_writer is not None:
                 tb_writer.add_scalar('train_loss_patches/dist_loss', ema_dist_for_log, iteration)
                 tb_writer.add_scalar('train_loss_patches/normal_loss', ema_normal_for_log, iteration)
+                tb_writer.add_scalar('train_loss_patches/prior_l1_loss', ema_prior_l1_for_log, iteration)
+                tb_writer.add_scalar('train_loss_patches/prior_hf_loss', ema_prior_hf_for_log, iteration)
 
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
@@ -263,6 +502,13 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--external_prior_root", type=str, default="")
+    parser.add_argument("--external_prior_subdir", type=str, default="priors")
+    parser.add_argument("--external_prior_mask_subdir", type=str, default="")
+    parser.add_argument("--external_prior_exts", type=str, default="png,jpg,jpeg,webp")
+    parser.add_argument("--prior_l1_weight", type=float, default=0.0)
+    parser.add_argument("--prior_hf_weight", type=float, default=0.0)
+    parser.add_argument("--prior_mask_floor", type=float, default=0.0)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -274,7 +520,16 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint)
+    training(
+        lp.extract(args),
+        op.extract(args),
+        pp.extract(args),
+        args.test_iterations,
+        args.save_iterations,
+        args.checkpoint_iterations,
+        args.start_checkpoint,
+        args,
+    )
 
     # All done
     print("\nTraining complete.")
