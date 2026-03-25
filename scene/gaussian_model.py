@@ -124,7 +124,7 @@ class GaussianModel:
     def _estimate_init_dist2_fallback(self, points_np, spatial_lr_scale):
         n = int(points_np.shape[0])
         if n <= 1:
-            base = max(float(spatial_lr_scale) * 0.01, 1e-4)
+            base = max(min(float(spatial_lr_scale) * 1e-3, 1e-3), 1e-5)
             return torch.full((n,), base * base, device="cuda", dtype=torch.float32)
 
         mins = points_np.min(axis=0)
@@ -133,9 +133,11 @@ class GaussianModel:
         if not np.isfinite(diag) or diag <= 1e-8:
             diag = max(float(spatial_lr_scale), 1.0)
 
-        # Heuristic nearest-neighbor spacing surrogate.
-        # This is only used when distCUDA2 is unavailable / unstable.
-        spacing = max(diag / np.sqrt(float(n)), 1e-4)
+        # Conservative nearest-neighbor spacing surrogate.
+        # This is only used when distCUDA2 is unavailable / unstable,
+        # so we bias toward small initial splats to avoid rasterizer blow-ups.
+        spacing = max(diag / max(float(n), 1.0), 1e-5)
+        spacing = min(spacing, max(min(float(spatial_lr_scale) * 1e-3, 1e-3), 1e-5))
         return torch.full((n,), spacing * spacing, device="cuda", dtype=torch.float32)
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, max_points: int = 0):
@@ -167,7 +169,8 @@ class GaussianModel:
             print(f"[2DGS-init] distCUDA2 failed, fallback to heuristic scale init: {exc}")
             dist2 = self._estimate_init_dist2_fallback(points_np, spatial_lr_scale)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 2)
-        rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1.0
 
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
